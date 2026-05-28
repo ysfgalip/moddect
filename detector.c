@@ -18,7 +18,7 @@ struct detector_kallsyms {
 	struct vmap_area *(*find_vmap_area)(unsigned long addr);
 	struct module *(*mod_find)(unsigned long addr, void *tree);
 	void *mod_tree;
-	struct ftrace_ops __rcu *ftrace_ops_list;
+	struct list_head *ftrace_ops_trampoline_list;
 	// struct execmem_info is not exported in kernel, so walk the struct
 	// manually
 	unsigned long **execmem_info;
@@ -52,8 +52,9 @@ struct detector_kallsyms detector_kallsyms_constructor(void)
 
 	ret.mod_tree = (void *)kallsyms_lookup_name("mod_tree");
 
-	ret.ftrace_ops_list = *(struct ftrace_ops __rcu **)kallsyms_lookup_name(
-	    "ftrace_ops_list");
+	ret.ftrace_ops_trampoline_list =
+	    (struct list_head *)kallsyms_lookup_name(
+		"ftrace_ops_trampoline_list");
 
 	ret.execmem_info = (void *)kallsyms_lookup_name("execmem_info");
 
@@ -85,30 +86,64 @@ int rbtree_mod_insert(struct rb_root *root, struct module_memory_rbnode *data)
 	return 1;
 }
 
-struct module_memory_rbnode module_memtype_to_rbnode(struct module *mod,
-						     enum mod_mem_type memtype)
+struct module_memory_rbnode module_memory_to_rbnode(struct module_memory *mem)
 {
-	struct module_memory_rbnode ret = {.mem = mod->mem[memtype]};
-	pr_info("Module addr: %px", ret.mem.base);
+	struct module_memory_rbnode ret = {.mem = *mem};
+	return ret;
+}
+
+struct module_memory module_to_module_memory(struct module *mod,
+					     enum mod_mem_type memtype)
+{
+	struct module_memory ret = mod->mem[memtype];
+	pr_info("Module addr: %px", ret.base);
+	return ret;
+}
+
+int insert_module_memory_to_rbtree(struct rb_root *modtree,
+				   struct module_memory *mem)
+{
+	int ret = 0;
+	struct module_memory_rbnode *ins;
+	struct module_memory_rbnode temp;
+	temp = module_memory_to_rbnode(mem);
+	if (temp.mem.base) {
+		ins = kzalloc(sizeof(struct module_memory_rbnode), GFP_KERNEL);
+		*ins = temp;
+		ret = rbtree_mod_insert(modtree, ins);
+	} else {
+		pr_info("null ptr!");
+	}
 	return ret;
 }
 
 int insert_module_to_rbtree(struct rb_root *modtree, struct module *mod)
 {
 	int ret = 0;
-	struct module_memory_rbnode *ins;
-	struct module_memory_rbnode temp;
+	struct module_memory temp;
 	for (int i = MOD_TEXT; i < MOD_MEM_NUM_TYPES; i++) {
-		temp = module_memtype_to_rbnode(mod, i);
-		if (temp.mem.base) {
-			ins = kzalloc(sizeof(struct module_memory_rbnode),
-				      GFP_KERNEL);
-			*ins = temp;
-			ret = rbtree_mod_insert(modtree, ins);
-		} else {
-			pr_info("null ptr!");
-		}
+		temp = module_to_module_memory(mod, i);
+		insert_module_memory_to_rbtree(modtree, &temp);
 	}
+	return ret;
+}
+
+struct module_memory
+trampoline_alloc_to_module_memory(unsigned long trampoline,
+				  unsigned long trampoline_size)
+{
+	int size = ((int)trampoline_size) / PAGE_SIZE + PAGE_SIZE;
+	struct module_memory ret = {.base = (void *)trampoline, .size = size};
+	return ret;
+}
+
+int insert_ftrace_ops_to_rbtree(struct rb_root *modtree, struct ftrace_ops *ops)
+{
+	int ret = 0;
+	struct module_memory temp;
+	temp = trampoline_alloc_to_module_memory(ops->trampoline,
+						 ops->trampoline_size);
+	insert_module_memory_to_rbtree(modtree, &temp);
 	return ret;
 }
 
@@ -120,15 +155,17 @@ static void detector_work(struct work_struct *work)
 	struct module *this = THIS_MODULE;
 	int gap = 0;
 	int count = 0;
+	struct ftrace_ops *current_ops;
 
 	list_for_each_entry(this, THIS_MODULE->list.prev, list)
 	{
-		/*
-		pr_info("Module name: %s", this->name);
-		count++;
-		pr_info("Module count: %d", count);
-*/
 		insert_module_to_rbtree(&modtree, this);
+	}
+	list_for_each_entry(current_ops, dk.ftrace_ops_trampoline_list, list)
+	{
+		insert_ftrace_ops_to_rbtree(&modtree, current_ops);
+		pr_info("ops: %px tramp: %lx", current_ops,
+			current_ops->trampoline);
 	}
 	count = 0;
 	struct rb_node *current_node = rb_first(&modtree);
@@ -169,31 +206,14 @@ static void detector_work(struct work_struct *work)
 							temp_mod);
 						// Slice the name to bypass
 						// hooks
-						pr_info("Mod name: %c %s\nMod "
+						pr_info("Mod addr: %px\nMod "
+							"name: %c %s\nMod "
 							"state: %d",
+							temp_mod,
 							temp_mod->name[0],
 							temp_mod->name + 1,
 							temp_mod->state);
 					}
-					/* Not functional
-					// Check if a tracer exists in the area
-					rcu_read_lock();
-					pr_info("list: %px",
-						    dk.ftrace_ops_list);
-					for (ops = rcu_dereference(
-						 dk.ftrace_ops_list);
-					     ops;
-					     ops = rcu_dereference(ops->next)) {
-						pr_info("ops: %px tramp: %lx",
-							ops, ops->trampoline);
-
-						if (ops->trampoline ==
-						    gap_allocation->va_start)
-							pr_info(
-							    "tramp in place");
-					}
-					rcu_read_unlock();
-					*/
 					pr_info(
 					    "Unknown allocation: %px --- %px",
 					    (void *)gap_allocation->va_start,
