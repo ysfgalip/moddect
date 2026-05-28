@@ -7,7 +7,7 @@
 
 MODULE_LICENSE("GPL");
 
-#define PAGE_SIZE 4096;
+#define PAGE_SIZE 4096
 
 struct module_memory_rbnode {
 	struct module_memory mem;
@@ -19,7 +19,9 @@ struct detector_kallsyms {
 	struct module *(*mod_find)(unsigned long addr, void *tree);
 	void *mod_tree;
 	struct ftrace_ops __rcu *ftrace_ops_list;
-	struct execmem_info *execmem_info;
+	// struct execmem_info is not exported in kernel, so walk the struct
+	// manually
+	unsigned long **execmem_info;
 };
 
 static unsigned long lookup_name(const char *name)
@@ -53,8 +55,7 @@ struct detector_kallsyms detector_kallsyms_constructor(void)
 	ret.ftrace_ops_list = *(struct ftrace_ops __rcu **)kallsyms_lookup_name(
 	    "ftrace_ops_list");
 
-	ret.execmem_info =
-	    (struct execmem_info *)kallsyms_lookup_name("execmem_info");
+	ret.execmem_info = (void *)kallsyms_lookup_name("execmem_info");
 
 	return ret;
 }
@@ -122,10 +123,11 @@ static void detector_work(struct work_struct *work)
 
 	list_for_each_entry(this, THIS_MODULE->list.prev, list)
 	{
+		/*
 		pr_info("Module name: %s", this->name);
 		count++;
 		pr_info("Module count: %d", count);
-
+*/
 		insert_module_to_rbtree(&modtree, this);
 	}
 	count = 0;
@@ -134,74 +136,85 @@ static void detector_work(struct work_struct *work)
 	    container_of(current_node, struct module_memory_rbnode, node);
 	struct module_memory_rbnode *to_free;
 	void *previous_module_end =
-	    (void *)dk.execmem_info->ranges[EXECMEM_MODULE_TEXT].start;
+	    current_mod->mem.base + current_mod->mem.size + PAGE_SIZE;
 
 	struct ftrace_ops __rcu *ops;
-	while (current_node) {
-		pr_info("Area %d: %px + %d", count++, current_mod->mem.base,
-			current_mod->mem.size);
+	while (current_node = rb_next(current_node)) {
 		to_free = current_mod;
-		current_node = rb_next(current_node);
-		if (!current_node) {
-			kfree(to_free);
-			break;
-		}
+		previous_module_end =
+		    to_free->mem.base + to_free->mem.size + PAGE_SIZE;
 
 		current_mod = container_of(current_node,
 					   struct module_memory_rbnode, node);
+		pr_info("Area %d: %px + %d", count++, current_mod->mem.base,
+			current_mod->mem.size);
 		gap = current_mod->mem.base - previous_module_end;
 		if (to_free && gap > 0) {
 
 			struct vmap_area *gap_allocation = dk.find_vmap_area(
 			    (unsigned long)previous_module_end);
-			while (!gap_allocation) {
-				previous_module_end += PAGE_SIZE;
-				gap_allocation = dk.find_vmap_area(
-				    (unsigned long)previous_module_end);
-			}
-			while (gap_allocation &&
-			       (void *)gap_allocation->va_start <
-				   current_mod->mem.base) {
 
-				// Try to find the allocation in mod_tree
-				struct module *temp_mod = dk.mod_find(
-				    gap_allocation->va_start, dk.mod_tree);
-				if (temp_mod) {
-					pr_info("mod addr: %px", temp_mod);
-					// Slice the name to bypass hooks
-					pr_info("Mod name: %c %s",
-						temp_mod->name[0],
-						temp_mod->name + 1);
-				}
-				// Check if a tracer exists in the area
-				rcu_read_lock();
-				pr_info("list: %px",
-					rcu_dereference(dk.ftrace_ops_list));
-				for (ops = rcu_dereference(dk.ftrace_ops_list);
-				     ops; ops = rcu_dereference(ops->next)) {
-					pr_info("ops: %px tramp: %lx", ops,
-						ops->trampoline);
+			while (previous_module_end < current_mod->mem.base) {
+				while (gap_allocation &&
+				       previous_module_end <
+					   current_mod->mem.base) {
 
-					if (ops->trampoline ==
-					    gap_allocation->va_start)
-						pr_info("tramp in place");
+					// Try to find the allocation in
+					// mod_tree
+					struct module *temp_mod = dk.mod_find(
+					    gap_allocation->va_start,
+					    dk.mod_tree);
+					if (temp_mod) {
+						pr_info("mod addr: %px",
+							temp_mod);
+						// Slice the name to bypass
+						// hooks
+						pr_info("Mod name: %c %s\nMod "
+							"state: %d",
+							temp_mod->name[0],
+							temp_mod->name + 1,
+							temp_mod->state);
+					}
+					/* Not functional
+					// Check if a tracer exists in the area
+					rcu_read_lock();
+					pr_info("list: %px",
+						    dk.ftrace_ops_list);
+					for (ops = rcu_dereference(
+						 dk.ftrace_ops_list);
+					     ops;
+					     ops = rcu_dereference(ops->next)) {
+						pr_info("ops: %px tramp: %lx",
+							ops, ops->trampoline);
+
+						if (ops->trampoline ==
+						    gap_allocation->va_start)
+							pr_info(
+							    "tramp in place");
+					}
+					rcu_read_unlock();
+					*/
+					pr_info(
+					    "Unknown allocation: %px --- %px",
+					    (void *)gap_allocation->va_start,
+					    (void *)gap_allocation->va_end);
+					previous_module_end =
+					    (void *)gap_allocation->va_end;
+					gap_allocation = dk.find_vmap_area(
+					    (unsigned long)previous_module_end);
 				}
-				rcu_read_unlock();
-				/* ------------------------ */
-				pr_info("STH FISHY!: %px --- %px",
-					(void *)gap_allocation->va_start,
-					(void *)gap_allocation->va_end);
-				pr_info("flags: %lx",
-					gap_allocation->vm->flags);
-				previous_module_end =
-				    (void *)gap_allocation->va_end;
-				gap_allocation = dk.find_vmap_area(
-				    (unsigned long)previous_module_end);
+				while (!gap_allocation) {
+					pr_info("Unallocated: %px --- %px",
+						previous_module_end,
+						previous_module_end +
+						    PAGE_SIZE);
+
+					previous_module_end += PAGE_SIZE;
+					gap_allocation = dk.find_vmap_area(
+					    (unsigned long)previous_module_end);
+				}
 			}
 		}
-		previous_module_end =
-		    to_free->mem.base + to_free->mem.size + PAGE_SIZE;
-
 		kfree(to_free);
 	}
 }
@@ -211,15 +224,6 @@ int init_module(void)
 {
 	struct module_memory text_area = THIS_MODULE->mem[MOD_TEXT];
 	struct module_memory data_area = THIS_MODULE->mem[MOD_DATA];
-	pr_info("Text Address is: %px\n", text_area.base);
-	pr_info("Data Address is: %px\n", data_area.base);
-	pr_info("Some Address is: %px\n", THIS_MODULE->mem[2]);
-	pr_info("Some Address is: %px\n", THIS_MODULE->mem[3]);
-	pr_info("Module text size is: %u\n", text_area.size);
-	pr_info("Module data size is: %u\n", data_area.size);
-	pr_info("Instruction is: %x %x %x %x %x %x %x %x %x\n", instr[0],
-		instr[1], instr[2], instr[3], instr[4], instr[5], instr[6],
-		instr[7], instr[8], instr[9]);
 	schedule_delayed_work(&detect_delayed, msecs_to_jiffies(1000));
 
 	return 0;
