@@ -1,13 +1,16 @@
 #include <linux/ftrace.h>
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
+#include <linux/list.h>
 #include <linux/module.h>
+#include <linux/proc_fs.h>
 #include <linux/rbtree.h>
 #include <linux/vmalloc.h>
 
 MODULE_LICENSE("GPL");
 
 #define PAGE_SIZE 4096
+#define PROC_NAME "moddect"
 
 struct module_memory_rbnode {
 	struct module_memory mem;
@@ -96,7 +99,6 @@ struct module_memory module_to_module_memory(struct module *mod,
 					     enum mod_mem_type memtype)
 {
 	struct module_memory ret = mod->mem[memtype];
-	pr_info("Module addr: %px", ret.base);
 	return ret;
 }
 
@@ -111,8 +113,6 @@ int insert_module_memory_to_rbtree(struct rb_root *modtree,
 		ins = kzalloc(sizeof(struct module_memory_rbnode), GFP_KERNEL);
 		*ins = temp;
 		ret = rbtree_mod_insert(modtree, ins);
-	} else {
-		pr_info("null ptr!");
 	}
 	return ret;
 }
@@ -147,6 +147,201 @@ int insert_ftrace_ops_to_rbtree(struct rb_root *modtree, struct ftrace_ops *ops)
 	return ret;
 }
 
+struct msg_node {
+	struct list_head list;
+	char *msg;
+	size_t len;
+};
+
+struct moddect_stream_state {
+	struct list_head queue;
+	struct msg_node *current_msg;
+	size_t offset;
+};
+
+static int add_msg_to_list(char *msg, struct list_head *head)
+{
+	struct msg_node *new = kmalloc(sizeof(*new), GFP_KERNEL);
+	if (!new)
+		return -ENOMEM;
+
+	new->msg = msg;
+	new->len = strlen(msg);
+	list_add_tail(&new->list, head);
+	return 0;
+}
+
+static int moddect_open(struct inode *inode, struct file *file)
+{
+	struct moddect_stream_state *st;
+	st = kzalloc(sizeof(*st), GFP_KERNEL);
+	INIT_LIST_HEAD(&st->queue);
+
+	// ----------------------------------------------
+	struct detector_kallsyms dk = detector_kallsyms_constructor();
+	struct module_memory_rbnode *ins;
+	struct rb_root modtree = RB_ROOT;
+	struct module *this = THIS_MODULE;
+	int gap = 0;
+	int count = 0;
+	struct ftrace_ops *current_ops;
+	char *tmp;
+
+	list_for_each_entry(this, THIS_MODULE->list.prev, list)
+	{
+		insert_module_to_rbtree(&modtree, this);
+	}
+	list_for_each_entry(current_ops, dk.ftrace_ops_trampoline_list, list)
+	{
+		insert_ftrace_ops_to_rbtree(&modtree, current_ops);
+		tmp = kasprintf(GFP_KERNEL, "ops: %px tramp: %lx\n",
+				current_ops, current_ops->trampoline);
+		add_msg_to_list(tmp, &st->queue);
+	}
+	count = 0;
+	struct rb_node *current_node = rb_first(&modtree);
+	struct module_memory_rbnode *current_mod =
+	    container_of(current_node, struct module_memory_rbnode, node);
+	struct module_memory_rbnode *to_free;
+	void *previous_module_end =
+	    current_mod->mem.base + current_mod->mem.size + PAGE_SIZE;
+
+	struct ftrace_ops __rcu *ops;
+	while (current_node = rb_next(current_node)) {
+		to_free = current_mod;
+		previous_module_end =
+		    to_free->mem.base + to_free->mem.size + PAGE_SIZE;
+
+		current_mod = container_of(current_node,
+					   struct module_memory_rbnode, node);
+		tmp = kasprintf(GFP_KERNEL, "Area %d: %px + %d\n", count++,
+				current_mod->mem.base, current_mod->mem.size);
+		add_msg_to_list(tmp, &st->queue);
+		gap = current_mod->mem.base - previous_module_end;
+		if (to_free && gap > 0) {
+
+			struct vmap_area *gap_allocation = dk.find_vmap_area(
+			    (unsigned long)previous_module_end);
+
+			while (previous_module_end < current_mod->mem.base) {
+				while (gap_allocation &&
+				       previous_module_end <
+					   current_mod->mem.base) {
+
+					// Try to find the allocation in
+					// mod_tree
+					struct module *temp_mod = dk.mod_find(
+					    gap_allocation->va_start,
+					    dk.mod_tree);
+					if (temp_mod) {
+						// Slice the name to bypass
+						// hooks
+						tmp = kasprintf(
+						    GFP_KERNEL,
+						    "Mod addr: %px\nMod "
+						    "name: %c %s\nMod "
+						    "state: %d\n",
+						    temp_mod, temp_mod->name[0],
+						    temp_mod->name + 1,
+						    temp_mod->state);
+						add_msg_to_list(tmp,
+								&st->queue);
+					}
+					tmp = kasprintf(
+					    GFP_KERNEL,
+					    "Unknown allocation: %px --- %px\n",
+					    (void *)gap_allocation->va_start,
+					    (void *)gap_allocation->va_end);
+					add_msg_to_list(tmp, &st->queue);
+					previous_module_end =
+					    (void *)gap_allocation->va_end;
+					gap_allocation = dk.find_vmap_area(
+					    (unsigned long)previous_module_end);
+				}
+				while (!gap_allocation) {
+					tmp = kasprintf(
+					    GFP_KERNEL,
+					    "Unallocated: %px --- %px\n",
+					    previous_module_end,
+					    previous_module_end + PAGE_SIZE);
+					add_msg_to_list(tmp, &st->queue);
+
+					previous_module_end += PAGE_SIZE;
+					gap_allocation = dk.find_vmap_area(
+					    (unsigned long)previous_module_end);
+				}
+			}
+		}
+		kfree(to_free);
+	}
+	// ----------------------------------------------
+	st->current_msg = NULL;
+	st->offset = 0;
+	file->private_data = st;
+	return 0;
+// TODO: Add proper error handling on fail
+fail:
+	return 0;
+}
+
+static ssize_t moddect_read(struct file *file, char __user *ubufm, size_t count,
+			    loff_t *ppos)
+{
+	size_t to_copy, remaining;
+	struct moddect_stream_state *st = file->private_data;
+	if (!st->current_msg) {
+		if (list_empty(&st->queue)) {
+			return 0;
+		}
+		st->current_msg =
+		    list_first_entry(&st->queue, struct msg_node, list);
+		list_del(&st->current_msg->list);
+		st->offset = 0;
+	}
+
+	remaining = st->current_msg->len - st->offset;
+	to_copy = min(count, remaining);
+
+	if (copy_to_user(ubufm, st->current_msg->msg + st->offset, to_copy)) {
+		return -EFAULT;
+	}
+
+	st->offset += to_copy;
+	if (st->offset >= st->current_msg->len) {
+		kfree(st->current_msg->msg);
+		kfree(st->current_msg);
+		st->current_msg = NULL;
+		st->offset = 0;
+	}
+	return to_copy;
+}
+
+static int moddect_release(struct inode *inode, struct file *file)
+{
+	struct moddect_stream_state *st = file->private_data;
+	struct msg_node *pos, *tmp;
+	list_for_each_entry_safe(pos, tmp, &st->queue, list)
+	{
+		list_del(&pos->list);
+		kfree(pos->msg);
+		kfree(pos);
+	}
+	if (st->current_msg) {
+		kfree(st->current_msg->msg);
+		kfree(st->current_msg);
+	}
+	kfree(st);
+	return 0;
+}
+
+static const struct proc_ops moddect_proc_ops = {
+    .proc_open = moddect_open,
+    .proc_read = moddect_read,
+    .proc_release = moddect_release,
+};
+
+// TODO: This work is redundant, maybe remove it or use the procfs open function
+// instead
 static void detector_work(struct work_struct *work)
 {
 	struct detector_kallsyms dk = detector_kallsyms_constructor();
@@ -240,11 +435,17 @@ static void detector_work(struct work_struct *work)
 }
 static DECLARE_DELAYED_WORK(detect_delayed, detector_work);
 
+static struct proc_dir_entry *proc_entry;
+
 int init_module(void)
 {
-	struct module_memory text_area = THIS_MODULE->mem[MOD_TEXT];
-	struct module_memory data_area = THIS_MODULE->mem[MOD_DATA];
 	schedule_delayed_work(&detect_delayed, msecs_to_jiffies(1000));
+
+	proc_entry = proc_create(PROC_NAME, 0444, NULL, &moddect_proc_ops);
+	if (!proc_entry) {
+		pr_err("moddect: proc_create failed\n");
+		return -ENOMEM;
+	}
 
 	return 0;
 }
@@ -252,5 +453,6 @@ int init_module(void)
 void cleanup_module(void)
 {
 	pr_info("Unloading module!");
+	proc_remove(proc_entry);
 	return;
 }
