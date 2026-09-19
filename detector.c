@@ -192,10 +192,7 @@ static void detector_work(struct work_struct *work)
 			    (unsigned long)previous_module_end);
 
 			while (previous_module_end < current_mod->mem.base) {
-				while (gap_allocation &&
-				       previous_module_end <
-					   current_mod->mem.base) {
-
+				if (gap_allocation) {
 					// Try to find the allocation in
 					// mod_tree
 					struct module *temp_mod = dk.mod_find(
@@ -220,19 +217,16 @@ static void detector_work(struct work_struct *work)
 					    (void *)gap_allocation->va_end);
 					previous_module_end =
 					    (void *)gap_allocation->va_end;
-					gap_allocation = dk.find_vmap_area(
-					    (unsigned long)previous_module_end);
-				}
-				while (!gap_allocation) {
+				} else {
 					pr_info("Unallocated: %px --- %px",
 						previous_module_end,
 						previous_module_end +
 						    PAGE_SIZE);
 
 					previous_module_end += PAGE_SIZE;
-					gap_allocation = dk.find_vmap_area(
-					    (unsigned long)previous_module_end);
 				}
+				gap_allocation = dk.find_vmap_area(
+				    (unsigned long)previous_module_end);
 			}
 		}
 		kfree(to_free);
