@@ -13,6 +13,7 @@ guaranteed, use at your own risk.
 Clone the repo and compile the module.
 
 After the compilation, the module can be loaded with:
+
 ```bash
 modprobe detector.ko
 ```
