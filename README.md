@@ -15,7 +15,7 @@ Clone the repo and compile the module.
 After the compilation, the module can be loaded with:
 
 ```bash
-modprobe detector.ko
+modprobe moddect.ko
 ```
 
 ## Usage
@@ -24,5 +24,8 @@ The module runs the scan in the init function for now, but a `procfs`
 implementation is in development. For now, the scan result is printed into the
 kernel ring buffer and can be read with `dmesg` or from the journal
 alternatively.
+
+Scan is executed twice, one scans a created rbtree, and one uses a sorted array,
+you can comment-out the corresponding lines to use only one of them.
 
 It is advised to run the module in a virtual machine.
